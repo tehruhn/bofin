@@ -18,6 +18,8 @@ from qutip.cy.spmatfuncs import cy_ode_rhs
 from qutip.solver import Options, Result
 from numpy import matrix, linalg
 from qutip import settings
+from qutip.cy.heom import cy_pad_csr as _pad_csr
+
 from scipy.sparse.linalg import (
     use_solver,
     splu,
@@ -33,7 +35,8 @@ from qutip.cy.spconvert import dense2D_to_fastcsr_fmode
 from qutip.ui.progressbar import BaseProgressBar
 from copy import copy, deepcopy
 from qutip import state_number_enumerate
-
+def ab(a,b):
+    return a+b
 def add_at_idx(seq, k, val):
     """
     Add (subtract) a value in the tuple at position k
@@ -289,7 +292,12 @@ class BosonicHEOMSolver(object):
         # are close.
         # This happens in the normal overdamped drude-lorentz case.
         # We give a warning to tell the user this collation is being done
-        # automatically.
+        # automatically.  This is not strictly neccessary, but
+        # is a important for quick convergence in some cases.  
+        # Again, the tolerance we choose here could be improved.
+        # For analytical (matsubara) cases its fine, but for fitting examples it could 
+        # be problematic, and might be better to make the tolerance a user-supplied argument.
+        # This a niche problem though, so I will leave it as is at the moment.
         common_ck = []
         real_indices = []
         common_vk = []
@@ -1154,9 +1162,11 @@ class FermionicHEOMSolver(object):
         pos = int(nidx * block)
         
         
-        L_he_temp = _pad_csr(L, self.nhe, self.nhe, nidx, nidx)
-        #self.L_helems[pos : pos + block, pos : pos + block] += L
-        self.L_helems += L_he_temp
+        #L_he_temp = _pad_csr(L, self.nhe, self.nhe, nidx, nidx)
+        self.L_helems[pos : pos + block, pos : pos + block] += L
+        #self.L_helems += L_he_temp
+
+
 
 
     def fermion_grad_prev(self, he_n, k, prev_he, idx):
@@ -1209,12 +1219,14 @@ class FermionicHEOMSolver(object):
         block = self.N ** 2
         rowpos = int(rowidx * block)
         colpos = int(colidx * block)
-        L_he_temp = _pad_csr(op1, self.nhe, self.nhe, rowidx, colidx)
-   
-        self.L_helems += L_he_temp
-
-#        self.L_helems[rowpos : rowpos + block, colpos : colpos + block] += op1
-
+        #L_he_temp = _pad_csr(op1, self.nhe, self.nhe, rowidx, colidx)
+        
+        #self.L_helems += L_he_temp
+        #self.L_helems = ab(self.L_helems,L_he_temp)
+      
+        self.L_helems[rowpos : rowpos + block, colpos : colpos + block] += op1
+     
+        
     def fermion_grad_next(self, he_n, k, next_he, idx):
         """
         Get next gradient
@@ -1251,17 +1263,16 @@ class FermionicHEOMSolver(object):
         block = self.N ** 2
         rowpos = int(rowidx * block)
         colpos = int(colidx * block)
-        L_he_temp = _pad_csr(op2, self.nhe, self.nhe, rowidx, colidx)
+        #L_he_temp = _pad_csr(op2, self.nhe, self.nhe, rowidx, colidx)
    
-        self.L_helems += L_he_temp
-        #self.L_helems[rowpos : rowpos + block, colpos : colpos + block] += op2
+        #self.L_helems += L_he_temp
+        self.L_helems[rowpos : rowpos + block, colpos : colpos + block] += op2
 
     def fermion_rhs(self):
         """
         Make the RHS for fermionic case
         """
-      
-
+        
         for n in self.idx2he:
             he_n = self.idx2he[n]
             self.fermion_grad_n(he_n)
@@ -1276,7 +1287,7 @@ class FermionicHEOMSolver(object):
                         self.fermion_grad_next(he_n, k, next_he, m)
                     if prev_he and (prev_he in self.he2idx):
                         self.fermion_grad_prev(he_n, k, prev_he, m)
-
+     
     def _fermion_solver(self):
         """
         Utility function for fermionic solver.
@@ -1330,8 +1341,14 @@ class FermionicHEOMSolver(object):
         self.spreQdag = spreQdag
         self.spostQdag = spostQdag
         # make right hand side
+        
+      
+        self.L_helems=self.L_helems.tolil()
         self.fermion_rhs()
-
+        
+        self.L_helems=self.L_helems.tocsr()
+        #self.L_helems.tocsr()
+        
         # return output
         return self.L_helems, self.nhe
 
@@ -1632,7 +1649,7 @@ def _dsuper_list_td(t, y, L_list):
     return L * y
    
 
-def _pad_csr(A, row_scale, col_scale, insertrow=0, insertcol=0):
+def _pad_csr2(A, row_scale, col_scale, insertrow=0, insertcol=0):
     """
     Expand the input csr_matrix to a greater space as given by the scale.
     Effectively inserting A into a larger matrix
