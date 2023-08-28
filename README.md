@@ -1,3 +1,7 @@
+# Note about status of this repository.
+
+At the moment this repo is currently unmaintained, and may have compatability issues with recent versions of numpy, scipy, etc. A more stable version of this package has been incorporated direcly into QuTiP with greater functionality. See https://github.com/qutip & https://qutip.org/docs/latest/guide/guide-heom.html and the tutorials in qutip-tutorials.
+
 # BoFiN-HEOM (Python version) : A Bosonic and Fermionic hierarchical-equations-of-motion library with applications in light-harvesting, quantum control, and single-molecule electronics
 
 Neill Lambert, Tarun Raheja, Shahnawaz Ahmed, Alexander Pitchford, Franco Nori 
