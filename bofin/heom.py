@@ -18,6 +18,8 @@ from qutip.cy.spmatfuncs import cy_ode_rhs
 from qutip.solver import Options, Result
 from numpy import matrix, linalg
 from qutip import settings
+from qutip.cy.heom import cy_pad_csr as _pad_csr
+
 from scipy.sparse.linalg import (
     use_solver,
     splu,
@@ -33,7 +35,8 @@ from qutip.cy.spconvert import dense2D_to_fastcsr_fmode
 from qutip.ui.progressbar import BaseProgressBar
 from copy import copy, deepcopy
 from qutip import state_number_enumerate
-
+def ab(a,b):
+    return a+b
 def add_at_idx(seq, k, val):
     """
     Add (subtract) a value in the tuple at position k
@@ -94,7 +97,51 @@ def _heom_state_dictionaries(dims, excitations):
 
     return nstates, state2idx, idx2state
 
+def _check_Hsys(H_sys):
+    # Check if Hamiltonians are one of the allowed types
+    if not isinstance(H_sys, (Qobj, QobjEvo, list)):
+        msg = "Hamiltonian format is incorrect."
+        raise RuntimeError(msg)
 
+    # Check if Hamiltonians supplied in the list are correct
+    if isinstance(H_sys, list):
+        for H in H_sys:
+            # If not a list of time dependent Hamiltonians
+            if not isinstance(H, list):
+                # Just check if it is a Qobj
+                _check_Hsys(H)
+
+            # Check if time dependent Hamiltonian terms are correct
+            # in the list fomat if it is a tuple of [H, callable]
+            elif isinstance(H[0], Qobj):
+                if not callable(H[1]):
+                    msg = "Incorrect time dependent function for Hamiltonian."
+                    raise RuntimeError(msg)
+
+            else:
+                _check_Hsys(H[0])
+
+        return True
+
+    else:
+        return True
+
+            
+def _check_coup_ops(coup_op, length):
+
+    if (type(coup_op) != Qobj) and (
+        type(coup_op) == list and type(coup_op[0]) != Qobj
+    ):
+        raise RuntimeError(
+            "Coupling operator must be a QObj or list " + " of QObjs."
+        )
+
+    if type(coup_op) == list:
+        if len(coup_op) != (length):
+            raise RuntimeError(
+                "Expected " + str(length) 
+                + " coupling operators."
+            )
 class BosonicHEOMSolver(object):
     """
     This is a class for solvers that use the HEOM method for
@@ -166,6 +213,8 @@ class BosonicHEOMSolver(object):
         self.options = None
         self.ode = None
 
+    
+                        
     def process_input(
         self, H_sys, coup_op, ckAR, ckAI, vkAR, vkAI, N_cut, options=None
         ):
@@ -176,41 +225,11 @@ class BosonicHEOMSolver(object):
 
         # Checks for Hamiltonian
 
-        if (
-            type(H_sys) != Qobj
-            and type(H_sys) != QobjEvo
-            and type(H_sys) != list
-        ):
-            raise RuntimeError("Hamiltonian format is incorrect.")
-
-        if type(H_sys) == list:
-            size = len(H_sys)
-            for i in range(0, size):
-                if i == 0:
-                    if type(H_sys[i]) != Qobj:
-                        raise RuntimeError("Hamiltonian format is incorrect.")
-                else:
-                    if (
-                        type(H_sys[i][0]) != Qobj
-                        and type(H_sys[i][1]) != function
-                    ):
-                        raise RuntimeError("Hamiltonian format is incorrect.")
+        _check_Hsys(H_sys)
 
         # Checks for coupling operator
+        _check_coup_ops(coup_op, len(ckAR) + len(ckAI))
 
-        if (type(coup_op) != Qobj) and (
-            type(coup_op) == list and type(coup_op[0]) != Qobj
-        ):
-            raise RuntimeError(
-                "Coupling operator must be a QObj or list " + " of QObjs."
-            )
-
-        if type(coup_op) == list:
-            if len(coup_op) != (len(ckAR) + len(ckAI)):
-                raise RuntimeError(
-                    "Expected " + str(len(ckAI) + len(ckAR)) 
-                    + " coupling operators."
-                )
 
         # Checks for ckAR, ckAI, vkAR, vkAI
 
@@ -273,7 +292,12 @@ class BosonicHEOMSolver(object):
         # are close.
         # This happens in the normal overdamped drude-lorentz case.
         # We give a warning to tell the user this collation is being done
-        # automatically.
+        # automatically.  This is not strictly neccessary, but
+        # is a important for quick convergence in some cases.  
+        # Again, the tolerance we choose here could be improved.
+        # For analytical (matsubara) cases its fine, but for fitting examples it could 
+        # be problematic, and might be better to make the tolerance a user-supplied argument.
+        # This a niche problem though, so I will leave it as is at the moment.
         common_ck = []
         real_indices = []
         common_vk = []
@@ -832,15 +856,150 @@ class BosonicHEOMSolver(object):
         
 
 
-def _dsuper_list_td(t, y, L_list):
+class HSolverDL(BosonicHEOMSolver):
     """
-    Auxiliary function for the integration.
-    Is called at every time step.
+    HEOM solver based on the Drude-Lorentz model for spectral density.
+    Drude-Lorentz bath the correlation functions can be exactly analytically
+    expressed as a sum of exponentials. 
+    This sub-class is included to give backwards compatability with the older
+    implentation in qutip.
+    
+  
+    Attributes
+    ----------
+    coup_strength : float
+        Coupling strength.
+    temperature : float
+        Bath temperature.
+    N_cut : int
+        Cutoff parameter for the bath
+    N_exp : int
+        Number of exponential terms used to approximate the bath correlation
+        functions
+    cut_freq : float
+        Bath spectral density cutoff frequency.
+    bnd_cut_approx : bool
+        Use boundary cut off approximation
+    options : :class:`qutip.solver.Options`
+        Generic solver options.
+        If set to None the default options will be used
+
+        
     """
-    L = L_list[0][0]
-    for n in range(1, len(L_list)):
-        L = L + L_list[n][0] * L_list[n][1](t)
-    return L * y
+
+    def __init__(self, H_sys, coup_op, coup_strength, temperature,
+                     N_cut, N_exp, cut_freq, bnd_cut_approx = False,
+                     options = None):
+        self.reset()
+
+        if options is None:
+            self.options = Options()
+        else:
+            self.options = options
+
+        
+        self.progress_bar = BaseProgressBar()
+
+        # the other attributes will be set in the configure method
+        self.configure(H_sys, coup_op, coup_strength, temperature,
+                     N_cut, N_exp, cut_freq, 
+                     bnd_cut_approx = bnd_cut_approx)
+        
+    def reset(self):
+        """
+        Reset any attributes to default values
+        """
+        BosonicHEOMSolver.reset(self)
+        
+        self.coup_strength = 0.0
+        self.cut_freq = 0.0
+        self.temperature = 1.0      
+        self.N_exp = 2
+     
+        
+    def configure(self, H_sys, coup_op, coup_strength, temperature,
+                 N_cut, N_exp,  cut_freq, 
+                 bnd_cut_approx = None, options=None):
+        """
+        
+        Configure the correlation function parameters using the required decompostion,
+        and then use the parent class BosonicHEOMSolver to check input and construct RHS.
+        
+        The parameters are described in the class attributes, unless there
+        is some specific behaviour
+        
+        """
+        self.coup_strength = coup_strength
+        self.cut_freq = cut_freq 
+        self.temperature = temperature     
+        self.N_exp = N_exp
+ 
+        
+        
+        if bnd_cut_approx is not None: self.bnd_cut_approx = bnd_cut_approx
+        
+        options = self.options            
+        progress_bar = self.progress_bar
+        
+        
+        ckAR, ckAI, vkAR, vkAI = self._calc_matsubara_params()
+       
+        Q = coup_op
+        
+        if bnd_cut_approx:
+            #do version with tanimura terminator
+            
+            
+            lam = self.coup_strength
+            gamma = self.cut_freq
+            T = self.temperature
+            beta = 1/T
+            Nk = self.N_exp
+            
+            op = -2*spre(Q)*spost(Q.dag()) + spre(Q.dag()*Q) + spost(Q.dag()*Q)
+            approx_factr = ((2 * lam / (beta * gamma)) - 1j*lam) 
+            approx_factr -=  lam * gamma * (-1.0j + 1/np.tan(gamma / (2 * T)))/gamma
+            
+            for k in range(1,Nk+1):
+                vk = 2 * np.pi * k * T
+                approx_factr -= ((4 * lam * gamma * T * vk / (vk**2 - gamma**2))/ vk)
+              
+            L_bnd = -approx_factr*op
+            H_sys = liouvillian(H_sys) + L_bnd
+
+        NR = len(ckAR)
+        NI = len(ckAI)
+        Q2 = [Q for kk in range(NR+NI)]
+        
+        BosonicHEOMSolver.configure(self, H_sys, Q2, ckAR, ckAI, vkAR, vkAI, N_cut, options)
+        
+    def _calc_matsubara_params(self):
+        """
+        Calculate the Matsubara coefficents and frequencies
+        Returns
+        -------
+        ckAR, ckAI, vkAR, vkAI: list(complex)
+        """
+      
+        lam = self.coup_strength
+        gamma = self.cut_freq                      
+        Nk = self.N_exp
+        T = self.temperature
+        
+        
+
+        ckAR = [ lam * gamma * (1/np.tan(gamma / (2 * T)))]
+        ckAR.extend([(4 * lam * gamma * T *  2 * np.pi * k * T / (( 2 * np.pi * k * T)**2 - gamma**2)) for k in range(1,Nk+1)])
+        vkAR = [gamma]
+        vkAR.extend([2 * np.pi * k * T for k in range(1,Nk+1)])
+
+        ckAI = [lam * gamma * (-1.0)]
+        vkAI = [gamma]
+
+        return ckAR, ckAI, vkAR, vkAI
+                    
+
+
 
 
 class FermionicHEOMSolver(object):
@@ -909,25 +1068,13 @@ class FermionicHEOMSolver(object):
 
         # Checks for Hamiltonian
 
-        if (
-            type(H_sys) != Qobj
-            and type(H_sys) != QobjEvo
-            and type(H_sys) != list
-        ):
-            raise RuntimeError("Hamiltonian format is incorrect.")
+        _check_Hsys(H_sys)
+            
+            
+        
+        # Checks for coupling operator
+        _check_coup_ops(coup_op,len(ck))
 
-        if type(H_sys) == list:
-            size = len(H_sys)
-            for i in range(0, size):
-                if i == 0:
-                    if type(H_sys[i]) != Qobj:
-                        raise RuntimeError("Hamiltonian format is incorrect.")
-                else:
-                    if (
-                        type(H_sys[i][0]) != Qobj
-                        and type(H_sys[i][1]) != function
-                    ):
-                        raise RuntimeError("Hamiltonian format is incorrect.")
 
         # Checks for cks and vks
 
@@ -946,19 +1093,7 @@ class FermionicHEOMSolver(object):
             if len(ck[idx]) != len(vk[idx]):
                 raise RuntimeError("Exponents supplied incorrectly.")
 
-        # Checks for coupling operator
-
-        if (type(coup_op) != Qobj) and (
-            type(coup_op) == list and type(coup_op[0]) != Qobj
-        ):
-            raise RuntimeError(
-                "Coupling operator must be a QObj or list " + " of QObjs."
-            )
-
-        if type(coup_op) == list:
-            if len(coup_op) != len(ck):
-                raise RuntimeError("Expected " + str(len(ck)) 
-                                    + " coupling operators.")
+    
 
         # Make list of coupling operators
 
@@ -1027,9 +1162,11 @@ class FermionicHEOMSolver(object):
         pos = int(nidx * block)
         
         
-        L_he_temp = _pad_csr(L, self.nhe, self.nhe, nidx, nidx)
-        #self.L_helems[pos : pos + block, pos : pos + block] += L
-        self.L_helems += L_he_temp
+        #L_he_temp = _pad_csr(L, self.nhe, self.nhe, nidx, nidx)
+        self.L_helems[pos : pos + block, pos : pos + block] += L
+        #self.L_helems += L_he_temp
+
+
 
 
     def fermion_grad_prev(self, he_n, k, prev_he, idx):
@@ -1082,12 +1219,14 @@ class FermionicHEOMSolver(object):
         block = self.N ** 2
         rowpos = int(rowidx * block)
         colpos = int(colidx * block)
-        L_he_temp = _pad_csr(op1, self.nhe, self.nhe, rowidx, colidx)
-   
-        self.L_helems += L_he_temp
-
-#        self.L_helems[rowpos : rowpos + block, colpos : colpos + block] += op1
-
+        #L_he_temp = _pad_csr(op1, self.nhe, self.nhe, rowidx, colidx)
+        
+        #self.L_helems += L_he_temp
+        #self.L_helems = ab(self.L_helems,L_he_temp)
+      
+        self.L_helems[rowpos : rowpos + block, colpos : colpos + block] += op1
+     
+        
     def fermion_grad_next(self, he_n, k, next_he, idx):
         """
         Get next gradient
@@ -1124,17 +1263,16 @@ class FermionicHEOMSolver(object):
         block = self.N ** 2
         rowpos = int(rowidx * block)
         colpos = int(colidx * block)
-        L_he_temp = _pad_csr(op2, self.nhe, self.nhe, rowidx, colidx)
+        #L_he_temp = _pad_csr(op2, self.nhe, self.nhe, rowidx, colidx)
    
-        self.L_helems += L_he_temp
-        #self.L_helems[rowpos : rowpos + block, colpos : colpos + block] += op2
+        #self.L_helems += L_he_temp
+        self.L_helems[rowpos : rowpos + block, colpos : colpos + block] += op2
 
     def fermion_rhs(self):
         """
         Make the RHS for fermionic case
         """
-      
-
+        
         for n in self.idx2he:
             he_n = self.idx2he[n]
             self.fermion_grad_n(he_n)
@@ -1149,7 +1287,7 @@ class FermionicHEOMSolver(object):
                         self.fermion_grad_next(he_n, k, next_he, m)
                     if prev_he and (prev_he in self.he2idx):
                         self.fermion_grad_prev(he_n, k, prev_he, m)
-
+     
     def _fermion_solver(self):
         """
         Utility function for fermionic solver.
@@ -1203,8 +1341,14 @@ class FermionicHEOMSolver(object):
         self.spreQdag = spreQdag
         self.spostQdag = spostQdag
         # make right hand side
+        
+      
+        self.L_helems=self.L_helems.tolil()
         self.fermion_rhs()
-
+        
+        self.L_helems=self.L_helems.tocsr()
+        #self.L_helems.tocsr()
+        
         # return output
         return self.L_helems, self.nhe
 
@@ -1505,7 +1649,7 @@ def _dsuper_list_td(t, y, L_list):
     return L * y
    
 
-def _pad_csr(A, row_scale, col_scale, insertrow=0, insertcol=0):
+def _pad_csr2(A, row_scale, col_scale, insertrow=0, insertcol=0):
     """
     Expand the input csr_matrix to a greater space as given by the scale.
     Effectively inserting A into a larger matrix
